@@ -804,6 +804,14 @@ pub(super) struct ClientCopyFind {
     pub(super) till: bool,
 }
 
+/// Copy-mode `H`/`M`/`L` targets; `Top`/`Bottom` carry the count as a line offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClientCopyViewportRow {
+    Top(u16),
+    Middle,
+    Bottom(u16),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ClientCopySearchPrompt {
     pub(super) direction: crate::api::schema::PaneCopySearchDirection,
@@ -849,8 +857,10 @@ pub(super) struct ClientCopyModeState {
     pub(super) search_current_global: Option<u64>,
     pub(super) search_generation: u64,
     pub(super) copy_after_search: bool,
-    /// Set after `f`/`F`/`t`/`T` until the target character key arrives.
-    pub(super) pending_find: Option<ClientCopyFind>,
+    /// A typed count prefix (`5j`), consumed by the next command.
+    pub(super) pending_count: Option<u16>,
+    /// Set after `f`/`F`/`t`/`T` (with its count) until the target character key arrives.
+    pub(super) pending_find: Option<(ClientCopyFind, u16)>,
     /// The last completed find, repeated by `;` and `,`.
     pub(super) last_find: Option<(char, ClientCopyFind)>,
 }

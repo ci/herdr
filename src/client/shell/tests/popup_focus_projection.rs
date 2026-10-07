@@ -124,6 +124,7 @@ fn modal_paste_target_requires_a_focused_editable_client_field() {
         search_current_global: None,
         search_generation: 0,
         copy_after_search: false,
+        pending_count: None,
         pending_find: None,
         last_find: None,
     });

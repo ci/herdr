@@ -1,6 +1,9 @@
 use super::*;
 use crossterm::event::{KeyCode, KeyModifiers};
 
+/// Largest copy-mode count prefix, so a typo cannot queue thousands of endpoint motions.
+const MAX_COPY_COUNT: u16 = 999;
+
 impl ClientShellState {
     pub(super) fn reset_copy_pipeline(&mut self) {
         self.copy_session_generation = self.copy_session_generation.saturating_add(1);
@@ -96,6 +99,7 @@ impl ClientShellState {
             search_current_global: None,
             search_generation: 0,
             copy_after_search: false,
+            pending_count: None,
             pending_find: None,
             last_find: None,
         });
@@ -113,6 +117,27 @@ impl ClientShellState {
         {
             return;
         }
+        let command = crate::copy_mode::copy_mode_command_char(key.clone());
+        if let Some(digit) = command.and_then(|command| command.to_digit(10)) {
+            if let Some(copy_mode) = self.copy_mode.as_mut() {
+                // `0` alone is the line-start motion; after another digit it extends the count.
+                if digit != 0 || copy_mode.pending_count.is_some() {
+                    let count = u32::from(copy_mode.pending_count.unwrap_or(0)) * 10 + digit;
+                    copy_mode.pending_count = Some(count.min(u32::from(MAX_COPY_COUNT)) as u16);
+                    outcome.repaint = true;
+                    return;
+                }
+            }
+        }
+        let count = self
+            .copy_mode
+            .as_mut()
+            .and_then(|copy_mode| copy_mode.pending_count.take());
+        if count.is_some() && key.code == KeyCode::Esc {
+            outcome.repaint = true;
+            return;
+        }
+        let repeat = count.unwrap_or(1);
         match key.code {
             KeyCode::Esc => {
                 let should_clear = self.copy_mode.as_ref().is_some_and(|copy_mode| {
@@ -147,19 +172,19 @@ impl ClientShellState {
                 return;
             }
             KeyCode::Left => {
-                self.move_copy_cursor(0, -1, outcome);
+                self.move_copy_cursor(0, -(repeat as i16), outcome);
                 return;
             }
             KeyCode::Down => {
-                self.move_copy_cursor(1, 0, outcome);
+                self.move_copy_cursor(repeat as i16, 0, outcome);
                 return;
             }
             KeyCode::Up => {
-                self.move_copy_cursor(-1, 0, outcome);
+                self.move_copy_cursor(-(repeat as i16), 0, outcome);
                 return;
             }
             KeyCode::Right => {
-                self.move_copy_cursor(0, 1, outcome);
+                self.move_copy_cursor(0, repeat as i16, outcome);
                 return;
             }
             KeyCode::PageUp => {
@@ -203,9 +228,57 @@ impl ClientShellState {
             _ => {}
         }
 
-        let Some(command) = crate::copy_mode::copy_mode_command_char(key.clone()) else {
+        let Some(command) = command else {
             return;
         };
+        let handled = match command {
+            'h' => self.move_copy_cursor(0, -(repeat as i16), outcome),
+            'j' => self.move_copy_cursor(repeat as i16, 0, outcome),
+            'k' => self.move_copy_cursor(-(repeat as i16), 0, outcome),
+            'l' => self.move_copy_cursor(0, repeat as i16, outcome),
+            'H' => self.move_copy_viewport_row(ClientCopyViewportRow::Top(repeat), outcome),
+            'M' => self.move_copy_viewport_row(ClientCopyViewportRow::Middle, outcome),
+            'L' => self.move_copy_viewport_row(ClientCopyViewportRow::Bottom(repeat), outcome),
+            'f' | 'F' | 't' | 'T' => {
+                if let Some(copy_mode) = self.copy_mode.as_mut() {
+                    copy_mode.pending_find = Some((
+                        ClientCopyFind {
+                            direction: if command.is_ascii_lowercase() {
+                                crate::api::schema::PaneCopySearchDirection::Forward
+                            } else {
+                                crate::api::schema::PaneCopySearchDirection::Backward
+                            },
+                            till: command.eq_ignore_ascii_case(&'t'),
+                        },
+                        repeat,
+                    ));
+                }
+                return;
+            }
+            ';' | ',' => self.repeat_copy_find(command == ',', repeat, outcome),
+            _ => false,
+        };
+        if handled {
+            return;
+        }
+        // Remaining motions repeat as a whole: endpoint-backed ones queue and run in order.
+        let repeats = if matches!(
+            command,
+            'w' | 'b' | 'e' | 'W' | 'B' | 'E' | '{' | '}' | 'n' | 'N'
+        ) {
+            repeat
+        } else {
+            1
+        };
+        for _ in 0..repeats {
+            if !self.run_copy_command(command, outcome) {
+                return;
+            }
+        }
+        outcome.repaint = true;
+    }
+
+    fn run_copy_command(&mut self, command: char, outcome: &mut ClientShellInput) -> bool {
         match command {
             'q' => self.exit_copy_mode(false, outcome),
             'y' => {
@@ -215,10 +288,7 @@ impl ClientShellState {
             }
             'v' | ' ' => self.begin_copy_selection(false),
             'V' => self.begin_copy_selection(true),
-            'h' => self.move_copy_cursor(0, -1, outcome),
-            'j' => self.move_copy_cursor(1, 0, outcome),
-            'k' => self.move_copy_cursor(-1, 0, outcome),
-            'l' => self.move_copy_cursor(0, 1, outcome),
+            'o' => self.swap_copy_selection_ends(outcome),
             'g' => self.move_copy_history(true, outcome),
             'G' => self.move_copy_history(false, outcome),
             '0' => {
@@ -254,20 +324,6 @@ impl ClientShellState {
             ),
             'E' => self
                 .request_copy_motion(crate::api::schema::PaneCopyMotion::NextBigWordEnd, outcome),
-            'f' | 'F' | 't' | 'T' => {
-                if let Some(copy_mode) = self.copy_mode.as_mut() {
-                    copy_mode.pending_find = Some(ClientCopyFind {
-                        direction: if command.is_ascii_lowercase() {
-                            crate::api::schema::PaneCopySearchDirection::Forward
-                        } else {
-                            crate::api::schema::PaneCopySearchDirection::Backward
-                        },
-                        till: command.eq_ignore_ascii_case(&'t'),
-                    });
-                }
-                return;
-            }
-            ';' | ',' => self.repeat_copy_find(command == ',', outcome),
             '%' => {
                 self.request_copy_jump(crate::api::schema::PaneCopyJump::MatchingBracket, outcome)
             }
@@ -278,9 +334,9 @@ impl ClientShellState {
             '}' => {
                 self.request_copy_motion(crate::api::schema::PaneCopyMotion::NextParagraph, outcome)
             }
-            _ => return,
+            _ => return false,
         }
-        outcome.repaint = true;
+        true
     }
 
     /// After `f`/`F`/`t`/`T`, the next key is the target character. Any other key cancels.
@@ -289,7 +345,7 @@ impl ClientShellState {
         key: &crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) -> bool {
-        let Some(find) = self
+        let Some((find, count)) = self
             .copy_mode
             .as_mut()
             .and_then(|copy_mode| copy_mode.pending_find.take())
@@ -300,18 +356,26 @@ impl ClientShellState {
             if let Some(copy_mode) = self.copy_mode.as_mut() {
                 copy_mode.last_find = Some((target, find));
             }
-            self.request_copy_find(target, find, false, outcome);
+            // `3fx` is one find followed by two repeats, so till finds keep moving.
+            for repeat in 0..count {
+                self.request_copy_find(target, find, repeat > 0, outcome);
+            }
         }
         true
     }
 
-    fn repeat_copy_find(&mut self, reverse: bool, outcome: &mut ClientShellInput) {
+    fn repeat_copy_find(
+        &mut self,
+        reverse: bool,
+        count: u16,
+        outcome: &mut ClientShellInput,
+    ) -> bool {
         let Some((target, mut find)) = self
             .copy_mode
             .as_ref()
             .and_then(|copy_mode| copy_mode.last_find)
         else {
-            return;
+            return true;
         };
         if reverse {
             find.direction = match find.direction {
@@ -323,7 +387,11 @@ impl ClientShellState {
                 }
             };
         }
-        self.request_copy_find(target, find, true, outcome);
+        for _ in 0..count {
+            self.request_copy_find(target, find, true, outcome);
+        }
+        outcome.repaint = true;
+        true
     }
 
     fn request_copy_find(
@@ -585,9 +653,14 @@ impl ClientShellState {
             .cloned()
     }
 
-    fn move_copy_cursor(&mut self, row_delta: i16, col_delta: i16, outcome: &mut ClientShellInput) {
+    fn move_copy_cursor(
+        &mut self,
+        row_delta: i16,
+        col_delta: i16,
+        outcome: &mut ClientShellInput,
+    ) -> bool {
         let Some(copy_mode) = self.copy_mode.as_mut() else {
-            return;
+            return true;
         };
         let (width, height) = copy_mode.geometry;
         if col_delta < 0 {
@@ -621,6 +694,7 @@ impl ClientShellState {
         self.reveal_copy_cursor(outcome, false);
         self.sync_copy_selection();
         outcome.repaint = true;
+        true
     }
 
     fn move_copy_page(&mut self, direction: i8, half_page: bool, outcome: &mut ClientShellInput) {
@@ -680,6 +754,64 @@ impl ClientShellState {
         self.push_pane_scroll_offset(pane_id, offset_from_bottom, outcome);
         self.sync_copy_selection();
         outcome.repaint = true;
+    }
+
+    fn move_copy_viewport_row(
+        &mut self,
+        target: ClientCopyViewportRow,
+        outcome: &mut ClientShellInput,
+    ) -> bool {
+        let Some(copy_mode) = self.copy_mode.as_mut() else {
+            return true;
+        };
+        let height = u32::from(copy_mode.geometry.1.max(1));
+        let top = copy_mode
+            .max_offset_from_bottom
+            .saturating_sub(copy_mode.offset_from_bottom)
+            .min(u32::MAX as usize) as u32;
+        let last_row = copy_mode
+            .max_offset_from_bottom
+            .saturating_add(height as usize)
+            .saturating_sub(1)
+            .min(u32::MAX as usize) as u32;
+        // The copy-mode bar covers the pane's last row, like search results reveal around it.
+        let bottom = top.saturating_add(height.saturating_sub(2)).min(last_row);
+        copy_mode.cursor.row = match target {
+            ClientCopyViewportRow::Top(offset) => top
+                .saturating_add(u32::from(offset.saturating_sub(1)))
+                .min(bottom),
+            ClientCopyViewportRow::Middle => top + (bottom - top) / 2,
+            ClientCopyViewportRow::Bottom(offset) => bottom
+                .saturating_sub(u32::from(offset.saturating_sub(1)))
+                .max(top),
+        };
+        self.sync_copy_selection();
+        outcome.repaint = true;
+        true
+    }
+
+    /// vim `o`: move the cursor to the other end of the selection.
+    fn swap_copy_selection_ends(&mut self, outcome: &mut ClientShellInput) {
+        let Some(copy_mode) = self.copy_mode.as_mut() else {
+            return;
+        };
+        match copy_mode.selection {
+            Some(ClientCopySelection::Character { anchor }) => {
+                copy_mode.selection = Some(ClientCopySelection::Character {
+                    anchor: copy_mode.cursor,
+                });
+                copy_mode.cursor = anchor;
+            }
+            Some(ClientCopySelection::Linewise { anchor_row }) => {
+                copy_mode.selection = Some(ClientCopySelection::Linewise {
+                    anchor_row: copy_mode.cursor.row,
+                });
+                copy_mode.cursor.row = anchor_row;
+            }
+            None => return,
+        }
+        self.reveal_copy_cursor(outcome, false);
+        self.sync_copy_selection();
     }
 
     fn set_copy_cursor_col(&mut self, col: u16) {

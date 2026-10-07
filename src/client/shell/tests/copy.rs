@@ -40,6 +40,7 @@ fn pasted_help_and_copy_queries_normalize_single_line_text() {
         search_current_global: None,
         search_generation: 0,
         copy_after_search: false,
+        pending_count: None,
         pending_find: None,
         last_find: None,
     });
@@ -2396,4 +2397,211 @@ fn copy_find_and_bracket_jumps_are_endpoint_backed_and_repeatable() {
     let (_, jump) =
         jump_of(&state.handle_raw_events(vec![key(KeyCode::Char('5'), KeyModifiers::SHIFT)]));
     assert_eq!(jump, crate::api::schema::PaneCopyJump::MatchingBracket);
+}
+
+fn copy_mode_state_with_history(max_offset_from_bottom: u64) -> ClientShellState {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    // Large enough for counts and H/M/L to be distinguishable from edge clamping.
+    let pane = &mut pane_surface.panes[0];
+    for rect in [&mut pane.rect, &mut pane.inner_rect] {
+        rect.width = 40;
+        rect.height = 12;
+    }
+    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom,
+        viewport_rows: 12,
+    });
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+    let mut enter = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
+        &mut enter,
+    );
+    state
+}
+
+fn copy_key(state: &mut ClientShellState, ch: char) -> ClientShellInput {
+    let modifiers = if ch.is_ascii_uppercase() {
+        KeyModifiers::SHIFT
+    } else {
+        KeyModifiers::empty()
+    };
+    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Char(ch.to_ascii_lowercase()),
+        modifiers,
+    ))])
+}
+
+fn copy_cursor(state: &ClientShellState) -> crate::api::schema::PaneTextPoint {
+    state.copy_mode.as_ref().expect("copy mode").cursor
+}
+
+#[test]
+fn copy_counts_scale_local_motions_and_zero_extends_a_count() {
+    let mut state = copy_mode_state_with_history(40);
+    let start = copy_cursor(&state);
+
+    for ch in "4k".chars() {
+        copy_key(&mut state, ch);
+    }
+    assert_eq!(copy_cursor(&state).row, start.row - 4);
+    for ch in "10l".chars() {
+        copy_key(&mut state, ch);
+    }
+    assert_eq!(copy_cursor(&state).col, start.col + 10);
+    // A bare `0` is still the line-start motion.
+    copy_key(&mut state, '0');
+    assert_eq!(copy_cursor(&state).col, 0);
+    assert!(state.copy_mode.as_ref().unwrap().pending_count.is_none());
+
+    // Esc drops a pending count without leaving copy mode.
+    copy_key(&mut state, '3');
+    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Esc,
+        KeyModifiers::empty(),
+    ))]);
+    assert_eq!(state.mode, ClientShellMode::Copy);
+    copy_key(&mut state, 'j');
+    assert_eq!(copy_cursor(&state).row, start.row - 3);
+}
+
+#[test]
+fn copy_viewport_rows_follow_vim_h_m_l_with_counts() {
+    let mut state = copy_mode_state_with_history(40);
+    for ch in "20k".chars() {
+        copy_key(&mut state, ch);
+    }
+    let (top, bottom) = {
+        let copy_mode = state.copy_mode.as_ref().unwrap();
+        let top = (copy_mode.max_offset_from_bottom - copy_mode.offset_from_bottom) as u32;
+        // The copy-mode bar covers the last pane row.
+        (top, top + u32::from(copy_mode.geometry.1) - 2)
+    };
+    assert!(
+        bottom > top + 4,
+        "test needs a viewport taller than a few rows"
+    );
+
+    copy_key(&mut state, 'H');
+    assert_eq!(copy_cursor(&state).row, top);
+    for ch in "3H".chars() {
+        copy_key(&mut state, ch);
+    }
+    assert_eq!(copy_cursor(&state).row, top + 2);
+    copy_key(&mut state, 'L');
+    assert_eq!(copy_cursor(&state).row, bottom);
+    for ch in "2L".chars() {
+        copy_key(&mut state, ch);
+    }
+    assert_eq!(copy_cursor(&state).row, bottom - 1);
+    copy_key(&mut state, 'M');
+    assert_eq!(copy_cursor(&state).row, top + (bottom - top) / 2);
+}
+
+#[test]
+fn copy_o_moves_the_cursor_to_the_other_selection_end() {
+    let mut state = copy_mode_state_with_history(40);
+    let start = copy_cursor(&state);
+    copy_key(&mut state, 'v');
+    for ch in "2k3l".chars() {
+        copy_key(&mut state, ch);
+    }
+    let moved = copy_cursor(&state);
+
+    copy_key(&mut state, 'o');
+    assert_eq!(copy_cursor(&state), start);
+    assert_eq!(
+        state.copy_mode.as_ref().unwrap().selection,
+        Some(ClientCopySelection::Character { anchor: moved })
+    );
+    copy_key(&mut state, 'o');
+    assert_eq!(copy_cursor(&state), moved);
+
+    state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Esc,
+        KeyModifiers::empty(),
+    ))]);
+    copy_key(&mut state, 'V');
+    copy_key(&mut state, 'j');
+    copy_key(&mut state, 'o');
+    assert_eq!(copy_cursor(&state).row, moved.row);
+    assert_eq!(
+        state.copy_mode.as_ref().unwrap().selection,
+        Some(ClientCopySelection::Linewise {
+            anchor_row: moved.row + 1
+        })
+    );
+}
+
+#[test]
+fn copy_counts_queue_endpoint_motions_and_finds_in_order() {
+    let mut state = copy_mode_state_with_history(0);
+    let origin = copy_cursor(&state);
+    let request_of = |input: &ClientShellInput| match &input.actions[..] {
+        [ClientShellAction::Endpoint { request, .. }] => request.clone(),
+        actions => panic!("expected one endpoint request, got {actions:?}"),
+    };
+    let reply = |state: &mut ClientShellState, id: &str, col: u16| {
+        state.handle_endpoint_result(
+            "boot-1",
+            id,
+            Ok(crate::api::schema::ResponseResult::PaneCopyMotion {
+                pane_id: "pane_1".into(),
+                cursor: crate::api::schema::PaneTextPoint {
+                    row: origin.row,
+                    col,
+                },
+                content_revision: 0,
+            }),
+        )
+    };
+
+    // `3w` sends one word motion at a time, each from the previous result.
+    copy_key(&mut state, '3');
+    let mut request = request_of(&copy_key(&mut state, 'w'));
+    for col in origin.col + 1..=origin.col + 3 {
+        let crate::api::schema::Method::PaneCopyMotion(params) = &request.method else {
+            panic!("expected a word motion");
+        };
+        assert_eq!(
+            params.motion,
+            crate::api::schema::PaneCopyMotion::NextWordStart
+        );
+        assert_eq!(params.cursor.col, col - 1);
+        let (_, actions) = reply(&mut state, &request.id, col);
+        if col < origin.col + 3 {
+            let [ClientShellAction::Endpoint { request: next, .. }] = &actions[..] else {
+                panic!("the next counted motion should follow the reply");
+            };
+            request = next.clone();
+        } else {
+            assert!(actions.is_empty());
+        }
+    }
+
+    // `2tx` is a till find followed by one repeated till find.
+    copy_key(&mut state, '2');
+    copy_key(&mut state, 't');
+    let first = request_of(&copy_key(&mut state, 'x'));
+    let till = |repeat| crate::api::schema::PaneCopyJump::FindChar {
+        target: 'x',
+        direction: crate::api::schema::PaneCopySearchDirection::Forward,
+        till: true,
+        repeat,
+    };
+    assert!(matches!(
+        &first.method,
+        crate::api::schema::Method::PaneCopyJump(params) if params.jump == till(false)
+    ));
+    let (_, actions) = reply(&mut state, &first.id, 5);
+    assert!(matches!(
+        &actions[..],
+        [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method, crate::api::schema::Method::PaneCopyJump(params)
+                if params.jump == till(true) && params.cursor.col == 5)
+    ));
 }
