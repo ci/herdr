@@ -615,18 +615,35 @@ impl ClientShellState {
                 None
             }
             ClientShellMode::Copy => {
-                if self.copy_mode.as_ref().is_none_or(|copy_mode| {
-                    copy_mode.search_prompt.is_none() && copy_mode.pending_find.is_none()
-                }) && self.config.keybinds.matches_prefix(key)
-                {
+                let accepts_bindings = self.copy_mode.as_ref().is_none_or(|copy_mode| {
+                    copy_mode.search_prompt.is_none()
+                        && copy_mode.pending_find.is_none()
+                        && copy_mode.pending_count.is_none()
+                });
+                if accepts_bindings && self.config.keybinds.matches_prefix(key) {
                     self.mode = ClientShellMode::Prefix;
                     outcome.repaint = true;
+                } else if let Some(binding) = self.copy_mode_direct_binding(key, accepts_bindings) {
+                    self.record_binding(binding, outcome);
                 } else {
                     self.route_copy_mode_key(key, outcome);
                 }
                 None
             }
         }
+    }
+
+    /// Like tmux, copy-mode keys win; other direct bindings (pane navigation, custom
+    /// commands) keep working while the focused pane is in copy mode.
+    fn copy_mode_direct_binding(
+        &self,
+        key: &crate::input::TerminalKey,
+        accepts_bindings: bool,
+    ) -> Option<crate::input::KeybindMatch> {
+        if !accepts_bindings || !crate::copy_mode::copy_mode_yields_key(key) {
+            return None;
+        }
+        crate::input::resolve_direct_binding(&self.config.keybinds.keybinds, key)
     }
 
     pub(super) fn copy_or_terminal_mode(&self) -> ClientShellMode {

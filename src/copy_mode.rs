@@ -40,6 +40,17 @@ pub(crate) fn copy_mode_page_lines(height: u16, half_page: bool) -> usize {
     }
 }
 
+/// Whether copy mode leaves this key to direct keybindings: modified keys other than the
+/// `ctrl+b/f/u/d` paging keys. Plain and shifted keys always belong to copy mode.
+pub(crate) fn copy_mode_yields_key(key: &TerminalKey) -> bool {
+    let modifiers = key.modifiers.difference(KeyModifiers::SHIFT);
+    if modifiers.is_empty() {
+        return false;
+    }
+    !(modifiers == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char('b' | 'f' | 'u' | 'd')))
+}
+
 pub(crate) fn copy_mode_command_char(key: TerminalKey) -> Option<char> {
     if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
         return None;
