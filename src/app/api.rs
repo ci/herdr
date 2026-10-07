@@ -1136,6 +1136,9 @@ impl App {
             Method::PaneCopyMotion(params) => {
                 return self.handle_pane_copy_motion(request.id, params);
             }
+            Method::PaneCopyJump(params) => {
+                return self.handle_pane_copy_jump(request.id, params);
+            }
             Method::PaneCopySearch(params) => {
                 return self.handle_pane_copy_search(request.id, params);
             }

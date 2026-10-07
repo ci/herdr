@@ -251,6 +251,7 @@ impl HeadlessServer {
                 | Method::CommandInvoke(_)
                 | Method::LayoutSetSplitRatio(_)
                 | Method::PaneClose(_)
+                | Method::PaneCopyJump(_)
                 | Method::PaneCopyMotion(_)
                 | Method::PaneCopySearch(_)
                 | Method::PaneEditScrollback(_)

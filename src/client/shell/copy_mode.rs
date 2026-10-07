@@ -96,6 +96,8 @@ impl ClientShellState {
             search_current_global: None,
             search_generation: 0,
             copy_after_search: false,
+            pending_find: None,
+            last_find: None,
         });
         self.mode = ClientShellMode::Copy;
         true
@@ -106,7 +108,9 @@ impl ClientShellState {
         key: &crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) {
-        if self.route_copy_search_prompt_key(key, outcome) {
+        if self.route_copy_search_prompt_key(key, outcome)
+            || self.route_copy_pending_find_key(key, outcome)
+        {
             return;
         }
         match key.code {
@@ -250,6 +254,23 @@ impl ClientShellState {
             ),
             'E' => self
                 .request_copy_motion(crate::api::schema::PaneCopyMotion::NextBigWordEnd, outcome),
+            'f' | 'F' | 't' | 'T' => {
+                if let Some(copy_mode) = self.copy_mode.as_mut() {
+                    copy_mode.pending_find = Some(ClientCopyFind {
+                        direction: if command.is_ascii_lowercase() {
+                            crate::api::schema::PaneCopySearchDirection::Forward
+                        } else {
+                            crate::api::schema::PaneCopySearchDirection::Backward
+                        },
+                        till: command.eq_ignore_ascii_case(&'t'),
+                    });
+                }
+                return;
+            }
+            ';' | ',' => self.repeat_copy_find(command == ',', outcome),
+            '%' => {
+                self.request_copy_jump(crate::api::schema::PaneCopyJump::MatchingBracket, outcome)
+            }
             '{' => self.request_copy_motion(
                 crate::api::schema::PaneCopyMotion::PreviousParagraph,
                 outcome,
@@ -260,6 +281,67 @@ impl ClientShellState {
             _ => return,
         }
         outcome.repaint = true;
+    }
+
+    /// After `f`/`F`/`t`/`T`, the next key is the target character. Any other key cancels.
+    fn route_copy_pending_find_key(
+        &mut self,
+        key: &crate::input::TerminalKey,
+        outcome: &mut ClientShellInput,
+    ) -> bool {
+        let Some(find) = self
+            .copy_mode
+            .as_mut()
+            .and_then(|copy_mode| copy_mode.pending_find.take())
+        else {
+            return false;
+        };
+        if let Some(target) = crate::copy_mode::copy_mode_command_char(key.clone()) {
+            if let Some(copy_mode) = self.copy_mode.as_mut() {
+                copy_mode.last_find = Some((target, find));
+            }
+            self.request_copy_find(target, find, false, outcome);
+        }
+        true
+    }
+
+    fn repeat_copy_find(&mut self, reverse: bool, outcome: &mut ClientShellInput) {
+        let Some((target, mut find)) = self
+            .copy_mode
+            .as_ref()
+            .and_then(|copy_mode| copy_mode.last_find)
+        else {
+            return;
+        };
+        if reverse {
+            find.direction = match find.direction {
+                crate::api::schema::PaneCopySearchDirection::Forward => {
+                    crate::api::schema::PaneCopySearchDirection::Backward
+                }
+                crate::api::schema::PaneCopySearchDirection::Backward => {
+                    crate::api::schema::PaneCopySearchDirection::Forward
+                }
+            };
+        }
+        self.request_copy_find(target, find, true, outcome);
+    }
+
+    fn request_copy_find(
+        &mut self,
+        target: char,
+        find: ClientCopyFind,
+        repeat: bool,
+        outcome: &mut ClientShellInput,
+    ) {
+        self.request_copy_jump(
+            crate::api::schema::PaneCopyJump::FindChar {
+                target,
+                direction: find.direction,
+                till: find.till,
+                repeat,
+            },
+            outcome,
+        );
     }
 
     fn route_copy_search_prompt_key(
@@ -708,6 +790,19 @@ impl ClientShellState {
         self.dispatch_next_copy_operation(outcome);
     }
 
+    fn request_copy_jump(
+        &mut self,
+        jump: crate::api::schema::PaneCopyJump,
+        outcome: &mut ClientShellInput,
+    ) {
+        if self.copy_mode.is_none() {
+            return;
+        }
+        self.copy_operation_queue
+            .push_back(ClientCopyOperation::Jump(jump));
+        self.dispatch_next_copy_operation(outcome);
+    }
+
     pub(super) fn dispatch_next_copy_operation(&mut self, outcome: &mut ClientShellInput) {
         if self.copy_operation_in_flight {
             return;
@@ -728,6 +823,21 @@ impl ClientShellState {
                             pane_id: pane_id.clone(),
                             cursor: origin,
                             motion,
+                            content_revision: Some(copy_mode.content_revision),
+                        },
+                    ),
+                    PendingEndpointKind::CopyMotion {
+                        pane_id,
+                        origin,
+                        session_generation,
+                    },
+                ),
+                ClientCopyOperation::Jump(jump) => (
+                    crate::api::schema::Method::PaneCopyJump(
+                        crate::api::schema::PaneCopyJumpParams {
+                            pane_id: pane_id.clone(),
+                            cursor: origin,
+                            jump,
                             content_revision: Some(copy_mode.content_revision),
                         },
                     ),

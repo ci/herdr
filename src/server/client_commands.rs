@@ -20,6 +20,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "layout.set_split_ratio",
     "pane.clear",
     "pane.close",
+    "pane.copy_jump",
     "pane.copy_motion",
     "pane.copy_search",
     "pane.edit_scrollback",
@@ -292,6 +293,10 @@ mod tests {
         assert_eq!(
             actual.remove("pane.clear").as_deref(),
             Some("0301d288ba198ddaa427dd7421c71911cccaf4ea03544531efa8b67ca21b08f6")
+        );
+        assert_eq!(
+            actual.remove("pane.copy_jump").as_deref(),
+            Some("b70d662c1d08239c04bfa60dfa247b9fce1adfd68d68bb17ff4cae55cfac5474")
         );
         assert_eq!(
             actual.remove("pane.link.resolve").as_deref(),

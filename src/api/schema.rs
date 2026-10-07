@@ -175,6 +175,8 @@ pub enum Method {
     PaneSelectionRead(PaneSelectionReadParams),
     #[serde(rename = "pane.copy_motion")]
     PaneCopyMotion(PaneCopyMotionParams),
+    #[serde(rename = "pane.copy_jump")]
+    PaneCopyJump(PaneCopyJumpParams),
     #[serde(rename = "pane.copy_search")]
     PaneCopySearch(PaneCopySearchParams),
     #[serde(rename = "pane.list")]

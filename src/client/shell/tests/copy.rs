@@ -40,6 +40,8 @@ fn pasted_help_and_copy_queries_normalize_single_line_text() {
         search_current_global: None,
         search_generation: 0,
         copy_after_search: false,
+        pending_find: None,
+        last_find: None,
     });
 
     assert!(state.insert_copy_search_text("needle\r\n"));
@@ -2307,4 +2309,91 @@ fn copy_mode_repeat_during_projection_gap_stays_active() {
             Some(19)
         );
     }
+}
+
+#[test]
+fn copy_find_and_bracket_jumps_are_endpoint_backed_and_repeatable() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 0,
+        viewport_rows: 2,
+    });
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+    let mut enter = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
+        &mut enter,
+    );
+    let origin = state.copy_mode.as_ref().expect("copy mode").cursor;
+    let key = |code, modifiers| RawInputEvent::Key(crate::input::TerminalKey::new(code, modifiers));
+    let jump_of = |input: &ClientShellInput| match &input.actions[..] {
+        [ClientShellAction::Endpoint { request, .. }] => match &request.method {
+            crate::api::schema::Method::PaneCopyJump(params) => {
+                assert_eq!(params.cursor, origin);
+                (request.id.clone(), params.jump)
+            }
+            method => panic!("expected pane.copy_jump, got {method:?}"),
+        },
+        actions => panic!("expected one endpoint request, got {actions:?}"),
+    };
+    let reply = |state: &mut ClientShellState, request_id: &str| {
+        state.handle_endpoint_result(
+            "boot-1",
+            request_id,
+            Ok(crate::api::schema::ResponseResult::PaneCopyMotion {
+                pane_id: "pane_1".into(),
+                cursor: origin,
+                content_revision: 0,
+            }),
+        );
+    };
+
+    // `f` waits for its target; Esc cancels only the pending find.
+    assert!(state
+        .handle_raw_events(vec![key(KeyCode::Char('f'), KeyModifiers::empty())])
+        .actions
+        .is_empty());
+    assert!(state
+        .handle_raw_events(vec![key(KeyCode::Esc, KeyModifiers::empty())])
+        .actions
+        .is_empty());
+    assert_eq!(state.mode, ClientShellMode::Copy);
+    assert!(state.copy_mode.as_ref().unwrap().pending_find.is_none());
+
+    // `T(` is a backward till find; the target key is not treated as a command.
+    state.handle_raw_events(vec![key(KeyCode::Char('t'), KeyModifiers::SHIFT)]);
+    let (request_id, jump) =
+        jump_of(&state.handle_raw_events(vec![key(KeyCode::Char('9'), KeyModifiers::SHIFT)]));
+    assert_eq!(
+        jump,
+        crate::api::schema::PaneCopyJump::FindChar {
+            target: '(',
+            direction: crate::api::schema::PaneCopySearchDirection::Backward,
+            till: true,
+            repeat: false,
+        }
+    );
+    reply(&mut state, &request_id);
+
+    // `,` repeats it in the opposite direction.
+    let (request_id, jump) =
+        jump_of(&state.handle_raw_events(vec![key(KeyCode::Char(','), KeyModifiers::empty())]));
+    assert_eq!(
+        jump,
+        crate::api::schema::PaneCopyJump::FindChar {
+            target: '(',
+            direction: crate::api::schema::PaneCopySearchDirection::Forward,
+            till: true,
+            repeat: true,
+        }
+    );
+    reply(&mut state, &request_id);
+
+    let (_, jump) =
+        jump_of(&state.handle_raw_events(vec![key(KeyCode::Char('5'), KeyModifiers::SHIFT)]));
+    assert_eq!(jump, crate::api::schema::PaneCopyJump::MatchingBracket);
 }

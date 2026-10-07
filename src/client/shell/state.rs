@@ -797,6 +797,13 @@ pub(super) enum ClientCopySelection {
     },
 }
 
+/// A vim `f`/`F`/`t`/`T` find: direction and whether it stops one cell short of the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ClientCopyFind {
+    pub(super) direction: crate::api::schema::PaneCopySearchDirection,
+    pub(super) till: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ClientCopySearchPrompt {
     pub(super) direction: crate::api::schema::PaneCopySearchDirection,
@@ -806,6 +813,7 @@ pub(super) struct ClientCopySearchPrompt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClientCopyOperation {
     Motion(crate::api::schema::PaneCopyMotion),
+    Jump(crate::api::schema::PaneCopyJump),
     Search {
         query: String,
         direction: crate::api::schema::PaneCopySearchDirection,
@@ -841,6 +849,10 @@ pub(super) struct ClientCopyModeState {
     pub(super) search_current_global: Option<u64>,
     pub(super) search_generation: u64,
     pub(super) copy_after_search: bool,
+    /// Set after `f`/`F`/`t`/`T` until the target character key arrives.
+    pub(super) pending_find: Option<ClientCopyFind>,
+    /// The last completed find, repeated by `;` and `,`.
+    pub(super) last_find: Option<(char, ClientCopyFind)>,
 }
 
 pub(crate) struct ClientShellState {

@@ -315,6 +315,15 @@ impl TerminalRuntime {
         self.0.terminal_dimensions()
     }
 
+    pub(crate) fn copy_jump_target(
+        &self,
+        row: u32,
+        col: u16,
+        jump: crate::pane::TerminalCopyJump,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        self.0.copy_jump_target(row, col, jump)
+    }
+
     pub(crate) fn paragraph_motion_target(
         &self,
         row: u32,

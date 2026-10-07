@@ -1,13 +1,13 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyMotion,
-    PaneCopyMotionParams, PaneCopySearchDirection, PaneCopySearchParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
-    PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneInputSetParams,
-    PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit,
-    PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
-    PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
+    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCopyJump,
+    PaneCopyJumpParams, PaneCopyMotion, PaneCopyMotionParams, PaneCopySearchDirection,
+    PaneCopySearchParams, PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult,
+    PaneFocusDirectionParams, PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo,
+    PaneInputSetParams, PaneLayoutPane, PaneLayoutParams, PaneLayoutRect, PaneLayoutSnapshot,
+    PaneLayoutSplit, PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason,
+    PaneMoveResult, PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
@@ -380,6 +380,65 @@ impl App {
                     col: params.cursor.col,
                 }),
         };
+        let after = runtime.content_seq();
+        if params.content_revision.is_some() && after != before {
+            return encode_error(id, "stale_content", "pane content changed");
+        }
+        encode_success(
+            id,
+            ResponseResult::PaneCopyMotion {
+                pane_id: params.pane_id,
+                cursor: crate::api::schema::PaneTextPoint {
+                    row: target.row,
+                    col: target.col,
+                },
+                content_revision: after,
+            },
+        )
+    }
+
+    pub(super) fn handle_pane_copy_jump(
+        &mut self,
+        id: String,
+        params: PaneCopyJumpParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(runtime) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let before = runtime.content_seq();
+        if params
+            .content_revision
+            .is_some_and(|revision| revision != before || !before.is_multiple_of(2))
+        {
+            return encode_error(id, "stale_content", "pane content changed");
+        }
+        let jump = match params.jump {
+            PaneCopyJump::FindChar {
+                target,
+                direction,
+                till,
+                repeat,
+            } => crate::pane::TerminalCopyJump::FindChar {
+                target,
+                forward: direction == PaneCopySearchDirection::Forward,
+                till,
+                repeat,
+            },
+            PaneCopyJump::MatchingBracket => crate::pane::TerminalCopyJump::MatchingBracket,
+        };
+        // Like word motions, a jump with no target leaves the cursor where it is.
+        let target = runtime
+            .copy_jump_target(params.cursor.row, params.cursor.col, jump)
+            .unwrap_or(crate::pane::TerminalTextPoint {
+                row: params.cursor.row,
+                col: params.cursor.col,
+            });
         let after = runtime.content_seq();
         if params.content_revision.is_some() && after != before {
             return encode_error(id, "stale_content", "pane content changed");
@@ -2609,6 +2668,62 @@ mod tests {
                 cursor: crate::api::schema::PaneTextPoint { row: 0, col: 6 },
                 content_revision: 0,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn api_copy_jump_parses_wire_requests_and_uses_terminal_text() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                20,
+                5,
+                1000,
+                b"call(a, b)",
+            ),
+        );
+        let jump = |app: &mut App, jump: serde_json::Value| {
+            let request: crate::api::schema::Request = serde_json::from_value(serde_json::json!({
+                "id": "req", "method": "pane.copy_jump",
+                "params": {
+                    "pane_id": public_pane_id,
+                    "cursor": {"row": 0, "col": 0},
+                    "jump": jump,
+                }
+            }))
+            .unwrap();
+            let crate::api::schema::Method::PaneCopyJump(params) = request.method else {
+                panic!("pane.copy_jump should parse as PaneCopyJump");
+            };
+            let response = app.handle_pane_copy_jump(request.id, params);
+            let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+            match success.result {
+                ResponseResult::PaneCopyMotion { cursor, .. } => cursor.col,
+                result => panic!("unexpected copy jump result {result:?}"),
+            }
+        };
+
+        assert_eq!(
+            jump(
+                &mut app,
+                serde_json::json!({"kind": "find_char", "target": ",", "direction": "forward"})
+            ),
+            6
+        );
+        assert_eq!(
+            jump(
+                &mut app,
+                serde_json::json!({
+                    "kind": "find_char", "target": ",", "direction": "forward", "till": true
+                })
+            ),
+            5
+        );
+        assert_eq!(
+            jump(&mut app, serde_json::json!({"kind": "matching_bracket"})),
+            9
         );
     }
 

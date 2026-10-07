@@ -94,6 +94,22 @@ pub(crate) enum TerminalWordMotion {
     NextBigEnd,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalCopyJump {
+    /// vim `f`/`F`/`t`/`T` on the cursor's screen row. `repeat` (`;`/`,`) makes a till jump
+    /// skip a target directly next to the cursor so repeating keeps moving.
+    FindChar {
+        target: char,
+        forward: bool,
+        till: bool,
+        repeat: bool,
+    },
+    /// vim `%`: take the first bracket at or after the cursor on its row and jump to its partner.
+    MatchingBracket,
+}
+
+const COPY_JUMP_BRACKET_ROW_LIMIT: u32 = 1000;
+
 const COPY_MODE_WORD_SEPARATORS: &str = "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +431,37 @@ impl PaneTerminal {
             }
         }
         None
+    }
+
+    pub(crate) fn copy_jump_target(
+        &self,
+        row: u32,
+        col: u16,
+        jump: TerminalCopyJump,
+    ) -> Option<TerminalTextPoint> {
+        let core = self.ghostty.core.lock().ok()?;
+        let total_rows = core.terminal.total_rows().ok()?;
+        let row_chars = |row: u32| {
+            let row = usize::try_from(row).ok().filter(|row| *row < total_rows)?;
+            let rows = core
+                .terminal
+                .screen_text_rows_range(row, row.saturating_add(1))
+                .ok()?;
+            rows.first().map(copy_jump_row_chars)
+        };
+        let cursor = TerminalTextPoint { row, col };
+        match jump {
+            TerminalCopyJump::FindChar {
+                target,
+                forward,
+                till,
+                repeat,
+            } => find_char_col(&row_chars(row)?, col, target, forward, till, repeat)
+                .map(|col| TerminalTextPoint { row, col }),
+            TerminalCopyJump::MatchingBracket => {
+                matching_bracket_point(row_chars, cursor, COPY_JUMP_BRACKET_ROW_LIMIT)
+            }
+        }
     }
 
     fn retained_text_buffer(&self) -> Option<(RetainedTextBuffer, crate::ghostty::ActiveScreen)> {
@@ -1124,6 +1171,121 @@ fn terminal_cell_text(graphemes: &[u32]) -> String {
         .iter()
         .map(|codepoint| char::from_u32(*codepoint).unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect()
+}
+
+/// The leading character of each visible cell on a row, keyed by its column. Wide-glyph spacer
+/// cells are dropped so a jump always lands on the glyph's first column.
+fn copy_jump_row_chars(row: &crate::ghostty::ScreenTextRow) -> Vec<(u16, char)> {
+    row.cells
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| {
+            !matches!(
+                cell.wide,
+                crate::ghostty::CellWide::SpacerTail | crate::ghostty::CellWide::SpacerHead
+            )
+        })
+        .map_while(|(col, cell)| {
+            let ch = terminal_cell_text(&cell.graphemes)
+                .chars()
+                .next()
+                .unwrap_or(' ');
+            Some((u16::try_from(col).ok()?, ch))
+        })
+        .collect()
+}
+
+fn find_char_col(
+    chars: &[(u16, char)],
+    col: u16,
+    target: char,
+    forward: bool,
+    till: bool,
+    repeat: bool,
+) -> Option<u16> {
+    let cursor = chars.iter().rposition(|(cell_col, _)| *cell_col <= col)?;
+    let skip = usize::from(till && repeat);
+    let found = if forward {
+        let start = cursor.saturating_add(1).saturating_add(skip);
+        start
+            + chars
+                .get(start..)?
+                .iter()
+                .position(|(_, ch)| *ch == target)?
+    } else {
+        chars[..cursor.checked_sub(skip)?]
+            .iter()
+            .rposition(|(_, ch)| *ch == target)?
+    };
+    let land = match (till, forward) {
+        (false, _) => found,
+        (true, true) => found - 1,
+        (true, false) => found + 1,
+    };
+    chars.get(land).map(|(cell_col, _)| *cell_col)
+}
+
+fn bracket_partner(ch: char) -> Option<(char, bool)> {
+    match ch {
+        '(' => Some((')', true)),
+        '[' => Some((']', true)),
+        '{' => Some(('}', true)),
+        ')' => Some(('(', false)),
+        ']' => Some(('[', false)),
+        '}' => Some(('{', false)),
+        _ => None,
+    }
+}
+
+fn matching_bracket_point(
+    mut row_chars: impl FnMut(u32) -> Option<Vec<(u16, char)>>,
+    cursor: TerminalTextPoint,
+    row_limit: u32,
+) -> Option<TerminalTextPoint> {
+    let mut chars = row_chars(cursor.row)?;
+    let start = chars
+        .iter()
+        .rposition(|(cell_col, _)| *cell_col <= cursor.col)?;
+    let (offset, (bracket, (partner, forward))) = chars[start..]
+        .iter()
+        .enumerate()
+        .find_map(|(offset, (_, ch))| Some((offset, (*ch, bracket_partner(*ch)?))))?;
+    let start = start + offset;
+    let mut depth = 0usize;
+    let mut step = |ch: char| {
+        if ch == bracket {
+            depth += 1;
+        } else if ch == partner {
+            depth = depth.saturating_sub(1);
+            return depth == 0;
+        }
+        false
+    };
+    for distance in 0..=row_limit {
+        let row = if forward {
+            cursor.row.checked_add(distance)?
+        } else {
+            cursor.row.checked_sub(distance)?
+        };
+        if distance > 0 {
+            chars = row_chars(row)?;
+        }
+        let found = if forward {
+            let begin = if distance == 0 { start } else { 0 };
+            chars[begin..].iter().find(|(_, ch)| step(*ch))
+        } else {
+            let end = if distance == 0 {
+                start + 1
+            } else {
+                chars.len()
+            };
+            chars[..end].iter().rev().find(|(_, ch)| step(*ch))
+        };
+        if let Some((col, _)) = found {
+            return Some(TerminalTextPoint { row, col: *col });
+        }
+    }
+    None
 }
 
 fn text_class(text: &str) -> TextClass {
@@ -3727,6 +3889,71 @@ mod tests {
             ),
             Color::Rgb(122, 162, 247)
         );
+    }
+
+    fn copy_jump_pane(cols: u16, rows: u16, text: &str) -> PaneTerminal {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(cols, rows, 200).unwrap();
+        terminal.write(text.as_bytes());
+        PaneTerminal::new(GhosttyPaneTerminal::new(terminal, tx).unwrap())
+    }
+
+    fn find(target: char, forward: bool, till: bool, repeat: bool) -> TerminalCopyJump {
+        TerminalCopyJump::FindChar {
+            target,
+            forward,
+            till,
+            repeat,
+        }
+    }
+
+    #[test]
+    fn copy_find_char_follows_vim_find_and_till_semantics() {
+        let pane = copy_jump_pane(20, 2, "a,b,c d");
+        let col = |col, jump| pane.copy_jump_target(0, col, jump).map(|point| point.col);
+
+        assert_eq!(col(0, find(',', true, false, false)), Some(1));
+        assert_eq!(col(1, find(',', true, false, false)), Some(3));
+        assert_eq!(col(0, find(',', true, true, false)), Some(0));
+        // A repeated till skips the target right next to the cursor so `;` keeps moving.
+        assert_eq!(col(0, find(',', true, true, true)), Some(2));
+        assert_eq!(col(6, find(',', false, false, false)), Some(3));
+        assert_eq!(col(6, find(',', false, true, false)), Some(4));
+        assert_eq!(col(4, find(',', false, true, true)), Some(2));
+        assert_eq!(col(0, find('z', true, false, false)), None);
+        assert_eq!(col(0, find('a', false, false, false)), None);
+    }
+
+    #[test]
+    fn copy_find_char_lands_on_the_first_column_of_wide_glyphs() {
+        let pane = copy_jump_pane(20, 2, "a\u{4e2d}b\u{6587}c");
+        let col = |col, jump| pane.copy_jump_target(0, col, jump).map(|point| point.col);
+
+        assert_eq!(col(0, find('\u{6587}', true, false, false)), Some(4));
+        assert_eq!(col(0, find('c', true, false, false)), Some(6));
+        assert_eq!(col(6, find('\u{4e2d}', false, false, false)), Some(1));
+        // Starting on a wide glyph's trailing column still counts as being on that glyph.
+        assert_eq!(col(2, find('b', true, false, false)), Some(3));
+        assert_eq!(col(6, find('b', false, true, false)), Some(4));
+    }
+
+    #[test]
+    fn copy_matching_bracket_nests_and_crosses_rows() {
+        let pane = copy_jump_pane(20, 4, "x f(a[1], {b})\r\n  (\r\n  ) ]");
+        let point = |row, col| TerminalTextPoint { row, col };
+        let target = |row, col| pane.copy_jump_target(row, col, TerminalCopyJump::MatchingBracket);
+
+        // From a non-bracket, use the first bracket at or after the cursor on that row.
+        assert_eq!(target(0, 0), Some(point(0, 13)));
+        assert_eq!(target(0, 13), Some(point(0, 3)));
+        assert_eq!(target(0, 5), Some(point(0, 7)));
+        assert_eq!(target(0, 10), Some(point(0, 12)));
+        assert_eq!(target(1, 2), Some(point(2, 2)));
+        assert_eq!(target(2, 0), Some(point(1, 2)));
+        // An unmatched bracket stays put.
+        assert_eq!(target(2, 3), None);
+        // No bracket after the cursor on the row.
+        assert_eq!(target(0, 14), None);
     }
 
     fn wide_text_cells(text: &str) -> [crate::ghostty::ScreenTextCell; 2] {

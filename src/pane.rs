@@ -44,8 +44,9 @@ use self::agent_detection::{
 pub use self::terminal::InputState;
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{
-    TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
-    TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
+    TerminalCompressionStep, TerminalCopyJump, TerminalDirtyPatch, TerminalDirtyPatchOutcome,
+    TerminalReadSnapshot, TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint,
+    TerminalWordMotion,
 };
 pub use self::{
     state::PaneState,
@@ -3298,6 +3299,17 @@ impl PaneRuntime {
 
     pub(crate) fn terminal_dimensions(&self) -> Option<(u16, u16)> {
         self.terminal.dimensions()
+    }
+
+    pub(crate) fn copy_jump_target(
+        &self,
+        row: u32,
+        col: u16,
+        jump: crate::pane::TerminalCopyJump,
+    ) -> Option<crate::pane::TerminalTextPoint> {
+        let result = self.terminal.copy_jump_target(row, col, jump);
+        self.compression.wake();
+        result
     }
 
     pub(crate) fn paragraph_motion_target(

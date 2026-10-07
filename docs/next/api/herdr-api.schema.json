@@ -2462,6 +2462,80 @@
           ],
           "type": "object"
         },
+        "PaneCopyJump": {
+          "description": "A copy-mode jump that depends on text the client does not hold: vim `f`/`F`/`t`/`T` (`;`/`,`)\non the cursor row, or `%` to the partner of the next bracket.",
+          "oneOf": [
+            {
+              "properties": {
+                "direction": {
+                  "$ref": "#/schemas/request/$defs/PaneCopySearchDirection"
+                },
+                "kind": {
+                  "const": "find_char",
+                  "type": "string"
+                },
+                "repeat": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "target": {
+                  "maxLength": 1,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "till": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "kind",
+                "target",
+                "direction"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "kind": {
+                  "const": "matching_bracket",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PaneCopyJumpParams": {
+          "properties": {
+            "content_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "cursor": {
+              "$ref": "#/schemas/request/$defs/PaneTextPoint"
+            },
+            "jump": {
+              "$ref": "#/schemas/request/$defs/PaneCopyJump"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "cursor",
+            "jump"
+          ],
+          "type": "object"
+        },
         "PaneCopyMotion": {
           "enum": [
             "line_end",
@@ -5713,6 +5787,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneCopyMotionParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.copy_jump",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneCopyJumpParams"
             }
           },
           "required": [

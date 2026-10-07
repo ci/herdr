@@ -279,6 +279,31 @@ pub struct PaneCopyMotionParams {
     pub content_revision: Option<u64>,
 }
 
+/// A copy-mode jump that depends on text the client does not hold: vim `f`/`F`/`t`/`T` (`;`/`,`)
+/// on the cursor row, or `%` to the partner of the next bracket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PaneCopyJump {
+    FindChar {
+        target: char,
+        direction: PaneCopySearchDirection,
+        #[serde(default)]
+        till: bool,
+        #[serde(default)]
+        repeat: bool,
+    },
+    MatchingBracket,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneCopyJumpParams {
+    pub pane_id: String,
+    pub cursor: PaneTextPoint,
+    pub jump: PaneCopyJump,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneCopySearchDirection {
