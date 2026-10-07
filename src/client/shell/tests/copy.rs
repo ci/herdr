@@ -2308,3 +2308,57 @@ fn copy_mode_repeat_during_projection_gap_stays_active() {
         );
     }
 }
+
+#[test]
+fn copy_mode_honors_direct_bindings_except_its_own_keys() {
+    let config = toml::from_str::<Config>(
+        r#"
+[keys]
+focus_pane_left = "ctrl+h"
+focus_pane_right = "ctrl+d"
+"#,
+    )
+    .expect("configured keybinds");
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 20,
+        viewport_rows: 2,
+    });
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+    let mut enter = ClientShellInput::default();
+    state.record_binding(
+        crate::input::KeybindMatch::Action(crate::input::KeybindAction::CopyMode),
+        &mut enter,
+    );
+    let ctrl = |ch| {
+        vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char(ch),
+            KeyModifiers::CONTROL,
+        ))]
+    };
+
+    let focus = state.handle_raw_events(ctrl('h'));
+    assert!(
+        matches!(
+            focus.actions.as_slice(),
+            [ClientShellAction::Endpoint { request, .. }]
+                if matches!(&request.method, crate::api::schema::Method::PaneFocusDirection(params)
+                    if params.direction == crate::api::schema::PaneDirection::Left)
+        ),
+        "a direct navigation binding should work from copy mode: {:?}",
+        focus.actions
+    );
+
+    // `ctrl+d` stays copy-mode half-page down even though it is also bound directly.
+    let page = state.handle_raw_events(ctrl('d'));
+    assert!(!page.actions.iter().any(|action| matches!(
+        action,
+        ClientShellAction::Endpoint { request, .. }
+            if matches!(request.method, crate::api::schema::Method::PaneFocusDirection(_))
+    )));
+    assert_eq!(state.mode, ClientShellMode::Copy);
+}
